@@ -1,0 +1,268 @@
+-- Step 1: Identify and select duplicate job entries
+WITH dup_cte AS (
+    SELECT 
+        job_Title, 
+        Salary_Estimate, 
+        Company_Name, 
+        [Location], 
+        Headquarters,
+        ROW_NUMBER() OVER(PARTITION BY job_Title, Salary_Estimate, Company_Name, [Location], Headquarters ORDER BY Job_Title) AS dup
+    FROM work.dbo.Uncleaned_DS_jobs
+)
+SELECT *
+FROM dup_cte
+WHERE dup > 1;
+
+-- Step 2: View the uncleaned dataset
+SELECT *
+FROM work.dbo.Uncleaned_DS_jobs;
+
+-- Step 3: Clean the dataset
+-- Drop unnecessary index column
+ALTER TABLE work.dbo.Uncleaned_DS_jobs
+DROP COLUMN [index];
+
+-- Change Location column type
+ALTER TABLE work.dbo.Uncleaned_DS_jobs
+ALTER COLUMN [Location] VARCHAR(MAX);
+
+-- Clean Job_Title
+UPDATE Uncleaned_DS_jobs
+SET Job_Title = LTRIM(REPLACE(REPLACE(REPLACE(Job_Title, '(', ''), ')', ''), '-', ''))
+WHERE Job_Title LIKE '(Sr.)%';
+
+UPDATE work.dbo.Uncleaned_DS_jobs
+SET Job_Title = LTRIM(REPLACE(Job_Title, '20-0117', ''));
+
+-- Clean Salary_Estimate
+UPDATE Uncleaned_DS_jobs
+SET Salary_Estimate = LTRIM(REPLACE(REPLACE(REPLACE(REPLACE(Salary_Estimate, '(Glassdoor est.)', ''), '(Employer est.)', ''), 'k', ''), '$', ''));
+
+-- Clean Company_Name
+UPDATE compe
+SET Company_Name = LTRIM(CASE
+    WHEN Company_Name LIKE '%[0-9]' THEN LEFT(Company_Name, PATINDEX('%[0-9]%', Company_Name) - 1)
+    ELSE Company_Name
+END);
+
+-- Set NULL for invalid Headquarters, Founded, Revenue, Size, and Sector
+UPDATE Uncleaned_DS_jobs
+SET Headquarters = NULL
+WHERE Headquarters = '-1';
+
+UPDATE Uncleaned_DS_jobs
+SET Founded = NULL
+WHERE Founded = -1;
+
+UPDATE Uncleaned_DS_jobs
+SET Revenue = NULL
+WHERE Revenue = '-1';
+
+UPDATE Uncleaned_DS_jobs
+SET [Size] = NULL
+WHERE [Size] = '-1' OR [Size] = 'Unknown';
+
+UPDATE Uncleaned_DS_jobs
+SET Sector = NULL
+WHERE Sector = '-1' OR Sector = 'Unknown';
+
+UPDATE Uncleaned_DS_jobs
+SET Revenue = NULL
+WHERE Revenue LIKE 'unknown%';
+
+-- Clean Salary_Estimate format
+UPDATE Uncleaned_DS_jobs
+SET Salary_Estimate = TRIM(REPLACE(Salary_Estimate, '.', 'to'));
+
+-- Split Salary_Estimate into MIN and MAX
+WITH split_cte AS (
+    SELECT 
+        Salary_Estimate,
+        value AS Salary_Estimates,
+        Job_Title,
+        ROW_NUMBER() OVER (PARTITION BY Salary_Estimate, Job_Title ORDER BY Job_Title) AS rn
+    FROM Uncleaned_DS_jobs
+    CROSS APPLY STRING_SPLIT(Salary_Estimate, '-')
+),
+salary_cte AS (
+    SELECT 
+        Job_Title,
+        Salary_Estimate,
+        MAX(CASE WHEN rn = 1 THEN Salary_Estimates END) AS MIN_SAL,
+        MAX(CASE WHEN rn = 2 THEN Salary_Estimates END) AS MAX_SAL
+    FROM split_cte
+    GROUP BY Job_Title, Salary_Estimate
+)
+UPDATE u
+SET u.MIN_SAL = s.MIN_SAL,
+    u.MAX_SAL = s.MAX_SAL
+FROM Uncleaned_DS_jobs u
+JOIN salary_cte s
+ON u.Job_Title = s.Job_Title AND u.Salary_Estimate = s.Salary_Estimate;
+
+-- Drop unnecessary columns and add Competitor column
+ALTER TABLE Uncleaned_DS_jobs
+DROP COLUMN Competitors, Competitor;
+
+ALTER TABLE Uncleaned_DS_jobs
+ADD Competitor VARCHAR(MAX);
+
+-- Extract competitors
+WITH Competitors_cte AS (
+    SELECT 
+        Company_Name,
+        TRIM(value) AS Competitor,
+        ROW_NUMBER() OVER (PARTITION BY Company_Name ORDER BY Company_Name) AS rn
+    FROM Uncleaned_DS_jobs
+    CROSS APPLY STRING_SPLIT(Competitors, ',')
+)
+UPDATE u
+SET u.Competitors = c.Competitor
+FROM Uncleaned_DS_jobs u
+JOIN Competitors_cte c
+ON u.Company_Name = c.Company_Name;
+
+-- Drop Job_Description column
+ALTER TABLE Uncleaned_DS_jobs
+DROP COLUMN Job_Description;
+
+-- Clean Company competitors
+UPDATE work.dbo.compe
+SET Competitors = NULL
+WHERE Competitors LIKE '-1' OR Competitors LIKE 'Unknown';
+
+-- Extract competitors from company table
+SELECT 
+    Company_Name,
+    TRIM(value) AS Competitor
+FROM work.dbo.compe
+CROSS APPLY STRING_SPLIT(Competitors, ',');
+
+-- Add Average Salary column
+ALTER TABLE Uncleaned_DS_jobs
+ADD Average_sal AS (MIN_SAL + MAX_SAL) / 2;
+
+-- Clean Size column
+UPDATE work.dbo.Uncleaned_DS_jobs
+SET Size = TRIM(REPLACE(REPLACE(REPLACE(Size, 'to', '-'), 'employees', ''), '+', ''));
+
+-- Split Size into min and max sizes
+WITH zte AS (
+    SELECT 
+        Company_Name,
+        value AS sizes,
+        ROW_NUMBER() OVER (PARTITION BY Company_Name ORDER BY Job_Title) AS rn
+    FROM work.dbo.Uncleaned_DS_jobs	
+    CROSS APPLY STRING_SPLIT(Size, '-')
+),
+sizes_cte AS (
+    SELECT 
+        Company_Name,
+        MAX(CASE WHEN rn = 1 THEN sizes END) AS min_siz,
+        MAX(CASE WHEN rn = 2 THEN sizes END) AS max_siz
+    FROM zte
+    GROUP BY Company_Name
+)
+UPDATE t1
+SET t1.min_sizes = t2.min_siz,
+    t1.max_sizes = t2.max_siz
+FROM work.dbo.Uncleaned_DS_jobs t1
+JOIN sizes_cte t2
+ON t1.Company_Name = t2.Company_Name;
+
+-- Set NULL for empty Location
+UPDATE work.dbo.Uncleaned_DS_jobs
+SET Location = NULL
+WHERE Location = '';
+
+-- Add average sizes column
+ALTER TABLE Uncleaned_DS_jobs
+ADD avg_sizes AS (
+    CASE
+        WHEN min_sizes IS NOT NULL AND max_sizes IS NOT NULL THEN (min_sizes + max_sizes) / 2
+        WHEN min_sizes IS NOT NULL THEN min_sizes
+        WHEN max_sizes IS NOT NULL THEN max_sizes
+        ELSE NULL
+    END
+);
+
+-- Clean Revenue data
+ALTER TABLE Uncleaned_DS_jobs
+DROP COLUMN max_rev;
+
+WITH rev_cte AS (
+    SELECT 
+        Company_Name,
+        LTRIM(RTRIM(value)) AS revs,
+        Revenue AS original_revenue, 
+        ROW_NUMBER() OVER (PARTITION BY Company_Name ORDER BY Sector) AS re,
+        CASE 
+            WHEN value LIKE '%billion%' THEN 'billion'
+            WHEN value LIKE '%million%' THEN 'million'
+            ELSE NULL
+        END AS unit
+    FROM Uncleaned_DS_jobs
+    CROSS APPLY STRING_SPLIT(REPLACE(Revenue, '+', ''), '-')
+),  
+rev_fixed AS (
+    SELECT 
+        Company_Name,
+        original_revenue,
+        re,
+        COALESCE(unit, MAX(unit) OVER (PARTITION BY Company_Name)) AS final_unit,
+        revs
+    FROM rev_cte
+),  
+rev_cleaned AS (
+    SELECT 
+        Company_Name,
+        original_revenue,
+        re,
+        final_unit,
+        CASE 
+            WHEN final_unit = 'billion' THEN 
+                TRY_CAST(REPLACE(TRIM(SUBSTRING(revs, 1, NULLIF(PATINDEX('%[^0-9.]%', revs + 'x'), 0) - 1)), ',', '') AS DECIMAL(18,2)) * 1000000000
+            WHEN final_unit = 'million' THEN 
+                TRY_CAST(REPLACE(TRIM(SUBSTRING(revs, 1, NULLIF(PATINDEX('%[^0-9.]%', revs + 'x'), 0) - 1)), ',', '') AS DECIMAL(18,2)) * 1000000
+            ELSE NULL
+        END AS revenue_value
+    FROM rev_fixed
+),  
+final_values AS (
+    SELECT 
+        Company_Name,
+        original_revenue,
+        MAX(CASE WHEN re = 1 THEN revenue_value END) AS min_revenue,
+        CASE 
+            WHEN original_revenue LIKE '%+%' THEN NULL
+            ELSE MAX(CASE WHEN re = 2 THEN revenue_value END)
+        END AS max_revenue
+    FROM rev_cleaned
+    GROUP BY Company_Name, original_revenue
+)
+UPDATE U
+SET 
+    U.min_revenue = F.min_revenue,
+    U.max_revenue = F.max_revenue
+FROM Uncleaned_DS_jobs U
+JOIN final_values F 
+    ON U.Company_Name = F.Company_Name 
+    AND U.Revenue = F.original_revenue;
+
+-- Add average revenue column
+ALTER TABLE Uncleaned_DS_jobs
+ADD avg_rev AS (
+    CASE 
+        WHEN min_revenue IS NULL THEN max_revenue
+        WHEN max_revenue IS NULL THEN min_revenue
+        ELSE (min_revenue + max_revenue) / 2
+    END
+);
+
+-- Final selection of cleaned data
+SELECT *
+FROM Uncleaned_DS_jobs;
+
+-- Drop the Revenue column
+ALTER TABLE Uncleaned_DS_jobs
+DROP COLUMN Revenue;
